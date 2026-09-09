@@ -258,8 +258,9 @@ Refs #2785, #4483.
 ## Three-service unified setup (v0.14+)
 
 Since v0.14, `hermes-agent` can serve the gateway API and the built-in dashboard
-from the same process by setting `HERMES_DASHBOARD_HOST` and
-`HERMES_DASHBOARD_PORT`. Running agent and dashboard in one container means a
+from the same process. Enable the dashboard with `HERMES_DASHBOARD=1` and bind it
+via `HERMES_DASHBOARD_HOST`/`HERMES_DASHBOARD_PORT` — the flag is required;
+host/port alone never start it. Running agent and dashboard in one container means a
 single writer to `hermes-home`, eliminating the concurrent-init write conflicts
 that occur when `hermes-agent` and `hermes-dashboard` both start from the same
 image against the same volume.
@@ -289,8 +290,13 @@ services:
       - HERMES_HOME=/home/hermes/.hermes
       - HERMES_UID=${UID:-1000}
       - HERMES_GID=${GID:-1000}
+      - HERMES_DASHBOARD=1
       - HERMES_DASHBOARD_HOST=0.0.0.0
       - HERMES_DASHBOARD_PORT=9119
+      # Required: the dashboard auth gate refuses a non-loopback bind without
+      # a registered provider. Set DASHBOARD_PASSWORD in your .env.
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${DASHBOARD_USER:-admin}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}
     restart: unless-stopped
     networks:
       - hermes-net
@@ -326,9 +332,13 @@ volumes:
 ```
 
 Open http://localhost:8787 for chat and http://localhost:9119 for the dashboard.
+Because the dashboard binds beyond loopback inside the container, it is protected
+by its own basic-auth provider — the browser will prompt for the `DASHBOARD_USER` /
+`DASHBOARD_PASSWORD` you set. `API_SERVER_KEY` does not cover the dashboard; it
+guards only the gateway API on port 8642.
 Check `hermes gateway run --help` for the exact flag names for your agent release —
-the env-var equivalents shown above (`HERMES_DASHBOARD_HOST`, `HERMES_DASHBOARD_PORT`)
-are available in recent releases alongside the CLI flags.
+the env-var equivalents shown above (`HERMES_DASHBOARD=1`, `HERMES_DASHBOARD_HOST`,
+`HERMES_DASHBOARD_PORT`) are available in recent releases alongside the CLI flags.
 
 If you need the separate dashboard container (e.g. resource limits per service),
 `docker-compose.three-container.yml` still works. Add a `depends_on` from
