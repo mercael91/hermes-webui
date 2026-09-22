@@ -238,7 +238,7 @@ services:
 
 Do not copy only `API_SERVER_ENABLED=true` / `API_SERVER_HOST=0.0.0.0` into the
 agent service as a standalone fix. If you intentionally enable the agent API
-server, the agent also requires a real `API_SERVER_KEY` (at least 8 characters),
+server, the agent also requires a real `API_SERVER_KEY` (at least 16 characters),
 and the WebUI still needs `HERMES_API_URL` or `HERMES_WEBUI_GATEWAY_BASE_URL` to
 reach that service from its container.
 
