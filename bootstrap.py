@@ -18,6 +18,14 @@ import venv
 import webbrowser
 from pathlib import Path
 
+# Escape hatch: hermes-agent's hermes_bootstrap.py intercepts the process when
+# a lazy install/update is pending and os.execv's it into an isolated Python
+# 3.14 sandbox via venv_sync.relaunch_command. That sandbox lacks the Web UI
+# dependencies (e.g. yaml), so server.py dies with ModuleNotFoundError and
+# systemd restarts it in an infinite crash loop. Setting this before any
+# hermes-agent code is imported keeps the Web UI in its intended interpreter.
+os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+
 
 INSTALLER_URL = "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
 REPO_ROOT = Path(__file__).resolve().parent
