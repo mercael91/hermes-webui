@@ -18,15 +18,6 @@ import venv
 import webbrowser
 from pathlib import Path
 
-# Escape hatch: hermes-agent's hermes_bootstrap.py intercepts the process when
-# a lazy install/update is pending and os.execv's it into an isolated Python
-# 3.14 sandbox via venv_sync.relaunch_command. That sandbox lacks the Web UI
-# dependencies (e.g. yaml), so server.py dies with ModuleNotFoundError and
-# systemd restarts it in an infinite crash loop. Setting this before any
-# hermes-agent code is imported keeps the Web UI in its intended interpreter.
-os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
-
-
 INSTALLER_URL = "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -80,6 +71,16 @@ def _load_repo_dotenv() -> None:
 # Must run before DEFAULT_HOST / DEFAULT_PORT so os.getenv() picks up
 # values from .env even when bootstrap.py is invoked directly (not via start.sh).
 _load_repo_dotenv()
+
+# Escape hatch: hermes-agent's hermes_bootstrap.py intercepts the process when
+# a lazy install/update is pending and os.execv's it into an isolated Python
+# 3.14 sandbox via venv_sync.relaunch_command. That sandbox lacks the Web UI
+# dependencies (e.g. yaml), so server.py dies with ModuleNotFoundError and
+# systemd restarts it in an infinite crash loop. Set it *after* the repo .env
+# is loaded -- that loader assigns unconditionally, so a .env entry would
+# otherwise re-enable the crash loop -- and before any hermes-agent code is
+# imported, which keeps the Web UI in its intended interpreter.
+os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
 DEFAULT_HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
