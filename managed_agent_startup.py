@@ -5,6 +5,7 @@ import importlib
 import os
 from pathlib import Path
 import sys
+import threading
 
 
 #: hermes-agent's internal bridge variable (hermes_bootstrap -> venv_sync,
@@ -15,6 +16,24 @@ import sys
 #: relaunch disabled only while Agent code is being imported, so this guard is
 #: scoped to that boundary instead of the process lifetime.
 LAZY_INSTALL_GUARD = "HERMES_DISABLE_LAZY_INSTALLS"
+
+#: Module whose import carries that launch layer. Its body runs once -- Python
+#: caches the module afterwards -- so an import that finds it already loaded
+#: cannot relaunch anything and the boundary has nothing to override.
+LAUNCH_LAYER_MODULE = "hermes_bootstrap"
+
+#: os.environ is process-global, so the read/set/yield/restore sequence needs
+#: serializing. Without it two overlapping boundaries save each other's value and
+#: restore out of order: the first one to exit removes the guard while the other
+#: is still importing, and the second then re-exports "1" for the rest of the
+#: process lifetime -- exactly the regression this scoping exists to remove.
+#: Re-entrant so a single thread may nest boundaries.
+_BOUNDARY_LOCK = threading.RLock()
+
+
+def launch_layer_loaded() -> bool:
+    """True once the Agent launch layer is imported and cannot relaunch again."""
+    return LAUNCH_LAYER_MODULE in sys.modules
 
 
 @contextlib.contextmanager
@@ -29,16 +48,27 @@ def agent_import_boundary():
     ``security.allow_lazy_installs`` -- pm/install.py treats any truthy value
     as the policy. Whatever the operator had (set or unset) is restored as
     soon as the import returns, including when it fails.
+
+    The override is process-global, so it covers only imports that can still
+    relaunch. ``activate_managed_agent`` imports hermes_bootstrap under this
+    boundary before request threads exist; a later boundary -- the first-chat
+    ``run_agent`` import every request can reach -- finds that module cached and
+    applies nothing, instead of exposing the dual-purpose policy variable to
+    unrelated threads for the length of an import that cannot relaunch.
     """
-    previous = os.environ.get(LAZY_INSTALL_GUARD)
-    os.environ[LAZY_INSTALL_GUARD] = "1"
-    try:
+    if launch_layer_loaded():
         yield
-    finally:
-        if previous is None:
-            os.environ.pop(LAZY_INSTALL_GUARD, None)
-        else:
-            os.environ[LAZY_INSTALL_GUARD] = previous
+        return
+    with _BOUNDARY_LOCK:
+        previous = os.environ.get(LAZY_INSTALL_GUARD)
+        os.environ[LAZY_INSTALL_GUARD] = "1"
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(LAZY_INSTALL_GUARD, None)
+            else:
+                os.environ[LAZY_INSTALL_GUARD] = previous
 
 
 def activate_managed_agent() -> None:

@@ -9,9 +9,11 @@ unguarded Agent import replaces server.py with a process that dies on
 The same variable is read by pm/install.py as an unconditional override of
 ``security.allow_lazy_installs``. A process-wide value therefore outlives
 startup and silently disables on-demand installs the operator allowed. These
-tests pin the scoped contract: the override covers exactly the two Agent import
-boundaries (server startup activation and the first-chat run_agent import) and
-the operator's own value -- set, unset or ``0`` -- is back immediately after.
+tests pin the scoped contract: the override covers the Agent imports that can
+still relaunch (startup activation, plus the first-chat run_agent import while
+the launch layer is not loaded yet), overlapping boundaries cannot interleave
+their restoration, and the operator's own value -- set, unset or ``0`` -- is
+back immediately after.
 """
 
 from __future__ import annotations
@@ -20,6 +22,9 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -30,7 +35,11 @@ AGENT_RUNTIME = REPO_ROOT / "api" / "agent_runtime.py"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from managed_agent_startup import LAZY_INSTALL_GUARD, agent_import_boundary  # noqa: E402
+from managed_agent_startup import (  # noqa: E402
+    LAUNCH_LAYER_MODULE,
+    LAZY_INSTALL_GUARD,
+    agent_import_boundary,
+)
 
 
 # The Agent's launch layer: with a pending lazy install/update it replaces this
@@ -46,17 +55,11 @@ if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").strip().lower() not in {"1
     os.execv(sys.executable, [sys.executable, "-c", "raise SystemExit(97)"])
 """
 
-# Real run_agent.py imports hermes_bootstrap first, so an unguarded import at the
-# first-chat boundary relaunches the long-lived server exactly like startup does.
+# Real run_agent.py imports hermes_bootstrap first. Under the composed startup
+# below that module is already cached, so its launch layer cannot run again; the
+# not-loaded case is pinned separately in section 4.
 FAKE_RUN_AGENT = """
-import os
-import sys
-
-import hermes_bootstrap
-
-if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").strip().lower() not in {"1", "true", "yes"}:
-    sys.stderr.write("UNGUARDED-AGENT-IMPORT" + chr(10))
-    raise SystemExit(98)
+import hermes_bootstrap  # noqa: F401  (cached during startup: no relaunch runs)
 
 
 class AIAgent:
@@ -89,14 +92,22 @@ def _fake_agent_dir(tmp_path: Path) -> Path:
 # ---------- 1. the boundary override itself ---------------------------------
 
 
-def test_boundary_sets_one_and_restores_operator_value(monkeypatch):
+@pytest.fixture
+def launch_layer_unloaded(monkeypatch):
+    """A process that has not imported the Agent launch layer yet."""
+    monkeypatch.delitem(sys.modules, LAUNCH_LAYER_MODULE, raising=False)
+
+
+def test_boundary_sets_one_and_restores_operator_value(
+    launch_layer_unloaded, monkeypatch
+):
     monkeypatch.setenv(LAZY_INSTALL_GUARD, "0")
     with agent_import_boundary():
         assert os.environ[LAZY_INSTALL_GUARD] == "1"
     assert os.environ[LAZY_INSTALL_GUARD] == "0"
 
 
-def test_boundary_preserves_operator_opt_out(monkeypatch):
+def test_boundary_preserves_operator_opt_out(launch_layer_unloaded, monkeypatch):
     """An operator who disabled lazy installs keeps that setting."""
     monkeypatch.setenv(LAZY_INSTALL_GUARD, "1")
     with agent_import_boundary():
@@ -104,19 +115,91 @@ def test_boundary_preserves_operator_opt_out(monkeypatch):
     assert os.environ[LAZY_INSTALL_GUARD] == "1"
 
 
-def test_boundary_leaves_unset_when_operator_had_nothing(monkeypatch):
+def test_boundary_leaves_unset_when_operator_had_nothing(
+    launch_layer_unloaded, monkeypatch
+):
     monkeypatch.delenv(LAZY_INSTALL_GUARD, raising=False)
     with agent_import_boundary():
         assert os.environ[LAZY_INSTALL_GUARD] == "1"
     assert LAZY_INSTALL_GUARD not in os.environ
 
 
-def test_boundary_restores_after_failed_import(monkeypatch):
+def test_boundary_restores_after_failed_import(launch_layer_unloaded, monkeypatch):
     monkeypatch.setenv(LAZY_INSTALL_GUARD, "0")
     with pytest.raises(ImportError):
         with agent_import_boundary():
             raise ImportError("agent import failed")
     assert os.environ[LAZY_INSTALL_GUARD] == "0"
+
+
+def test_boundary_is_a_no_op_once_the_launch_layer_is_loaded(monkeypatch):
+    """After startup activation every later boundary has nothing to intercept."""
+    monkeypatch.setenv(LAZY_INSTALL_GUARD, "0")
+    monkeypatch.setitem(
+        sys.modules, LAUNCH_LAYER_MODULE, types.ModuleType(LAUNCH_LAYER_MODULE)
+    )
+    with agent_import_boundary():
+        assert os.environ[LAZY_INSTALL_GUARD] == "0"
+    assert os.environ[LAZY_INSTALL_GUARD] == "0"
+
+
+@pytest.mark.parametrize("operator_value", [None, "0", "1"])
+def test_overlapping_boundaries_cannot_interleave_their_restoration(
+    launch_layer_unloaded, monkeypatch, operator_value
+):
+    """Two threads inside the boundary: the guard has to survive until the last exit.
+
+    Unserialized, the first exit removes (or restores over) the value the second
+    boundary still relies on, and the second exit leaves the override set for the
+    rest of the process lifetime -- the in-process regression this scoping exists
+    to remove.
+    """
+    if operator_value is None:
+        monkeypatch.delenv(LAZY_INSTALL_GUARD, raising=False)
+    else:
+        monkeypatch.setenv(LAZY_INSTALL_GUARD, operator_value)
+
+    first_inside = threading.Event()
+    second_attempting = threading.Event()
+    release_first = threading.Event()
+    second_inside = threading.Event()
+    release_second = threading.Event()
+
+    def first_boundary():
+        with agent_import_boundary():
+            first_inside.set()
+            release_first.wait(10)
+
+    def second_boundary():
+        assert first_inside.wait(10)
+        second_attempting.set()
+        with agent_import_boundary():
+            second_inside.set()
+            release_second.wait(10)
+
+    first = threading.Thread(target=first_boundary, daemon=True)
+    second = threading.Thread(target=second_boundary, daemon=True)
+    first.start()
+    assert first_inside.wait(10), "first boundary never entered"
+    second.start()
+    assert second_attempting.wait(10), "second boundary never attempted entry"
+    # An unserialized second boundary records its own 'previous' right here.
+    time.sleep(0.05)
+    release_first.set()
+    first.join(10)
+    assert not first.is_alive(), "first boundary never exited"
+    assert second_inside.wait(10), "second boundary never entered"
+    assert os.environ.get(LAZY_INSTALL_GUARD) == "1", (
+        "guard dropped while a boundary was still importing: "
+        + repr(os.environ.get(LAZY_INSTALL_GUARD))
+    )
+    release_second.set()
+    second.join(10)
+    assert not second.is_alive(), "second boundary never exited"
+    if operator_value is None:
+        assert LAZY_INSTALL_GUARD not in os.environ
+    else:
+        assert os.environ[LAZY_INSTALL_GUARD] == operator_value
 
 
 # ---------- 2. bootstrap never exports the override --------------------------
@@ -293,6 +376,56 @@ def test_composed_startup_keeps_the_agent_interception_out_of_the_app(
     assert result.returncode == 0, result.stderr
     assert "SANDBOX-RELAUNCH" not in result.stderr, result.stderr
     assert "UNGUARDED-AGENT-IMPORT" not in result.stderr, result.stderr
+    assert ("AFTER=" + repr(operator_value)) in result.stdout, result.stdout
+
+
+COMPOSED_FIRST_CHAT_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    sys.path[0] = {repo_root!r}
+    sys.path.insert(1, {agent_dir!r})
+    import managed_agent_startup as mas
+    assert "hermes_bootstrap" not in sys.modules, "launch layer loaded too early"
+    with mas.agent_import_boundary():
+        import hermes_bootstrap
+    import os
+    print("AFTER=" + repr(os.environ.get({guard!r})))
+    """
+)
+
+
+@pytest.mark.parametrize("operator_value", [None, "0", "1"])
+def test_first_chat_import_is_guarded_while_the_launch_layer_is_not_loaded(
+    tmp_path, operator_value
+):
+    """Startup activation skipped or failed: the first-chat import is the one
+    that would relaunch this process, so the boundary still has to cover it.
+    """
+    agent_dir = _fake_agent_dir(tmp_path)
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop(LAZY_INSTALL_GUARD, None)
+    if operator_value is not None:
+        env[LAZY_INSTALL_GUARD] = operator_value
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            COMPOSED_FIRST_CHAT_SCRIPT.format(
+                repo_root=str(REPO_ROOT),
+                agent_dir=str(agent_dir),
+                guard=LAZY_INSTALL_GUARD,
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SANDBOX-RELAUNCH" not in result.stderr, result.stderr
     assert ("AFTER=" + repr(operator_value)) in result.stdout, result.stdout
 
 
