@@ -6,9 +6,12 @@
 #
 # Three-container Docker Compose: Hermes Agent + Dashboard + WebUI
 #
-# QUICK START:
+# QUICK START (chat/gateway only — this file starts no working dashboard):
 #   docker compose -f docker-compose.three-container.yml up -d
-#   Open http://localhost:8787 (chat) and http://localhost:9119 (dashboard)
+#   Open http://localhost:8787 (chat)
+# For a dashboard use docker-compose.three-service.yml, which sets
+# HERMES_DASHBOARD=1 (required for the integrated dashboard to start) and
+# registers a dashboard auth provider for its non-loopback bind.
 #
 # This extends the two-container setup with the Hermes Dashboard for
 # monitoring agent activity, sessions, and resource usage.

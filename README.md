@@ -526,7 +526,10 @@ docker run -d \
 If you want the agent and WebUI in separate containers (for isolation, or because you're already running an agent gateway elsewhere):
 
 ```bash
-# Agent + WebUI — no credentials needed in .env
+# Agent + WebUI — chat boots with no credentials in .env, but the gateway
+# health check and the Tasks panel need a matching API_SERVER_KEY (>=16 chars)
+# and the bind configuration described in docs/docker.md; without them the
+# WebUI reports the agent gateway as unreachable.
 docker compose -f docker-compose.two-container.yml up -d
 
 # Agent + Dashboard + WebUI — needs DASHBOARD_PASSWORD and a >=16-char
