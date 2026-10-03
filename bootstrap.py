@@ -18,6 +18,18 @@ import venv
 import webbrowser
 from pathlib import Path
 
+# Single definition of the Agent's lazy-install bridge variable. bootstrap.py
+# never exports it to the server it launches: the Agent import boundaries own
+# that override (managed_agent_startup.agent_import_boundary), so a launched
+# server keeps the operator's own environment.
+from managed_agent_startup import LAZY_INSTALL_GUARD
+
+# hermes-agent's hermes_bootstrap.py intercepts the process when a lazy
+# install/update is pending and os.execv's it into an isolated Python 3.14
+# sandbox via venv_sync.relaunch_command. That sandbox lacks the Web UI
+# dependencies (e.g. yaml), so a capability probe run inside it would report
+# the interpreter as unusable. Guard the probe interpreter only -- the value is
+# passed to that child and never lands in os.environ.
 INSTALLER_URL = "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -71,16 +83,6 @@ def _load_repo_dotenv() -> None:
 # Must run before DEFAULT_HOST / DEFAULT_PORT so os.getenv() picks up
 # values from .env even when bootstrap.py is invoked directly (not via start.sh).
 _load_repo_dotenv()
-
-# Escape hatch: hermes-agent's hermes_bootstrap.py intercepts the process when
-# a lazy install/update is pending and os.execv's it into an isolated Python
-# 3.14 sandbox via venv_sync.relaunch_command. That sandbox lacks the Web UI
-# dependencies (e.g. yaml), so server.py dies with ModuleNotFoundError and
-# systemd restarts it in an infinite crash loop. Set it *after* the repo .env
-# is loaded -- that loader assigns unconditionally, so a .env entry would
-# otherwise re-enable the crash loop -- and before any hermes-agent code is
-# imported, which keeps the Web UI in its intended interpreter.
-os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
 DEFAULT_HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
@@ -265,6 +267,7 @@ def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = No
         "try:\n    import yaml\nexcept ImportError:\n    import ruamel.yaml\n"
     )
     env = os.environ.copy()
+    env[LAZY_INSTALL_GUARD] = "1"
     if agent_dir:
         # PREPEND agent_dir to PYTHONPATH so an `agent_dir/run_agent.py` wins
         # over any stale `run_agent` package in system site-packages (sys.path
