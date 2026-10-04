@@ -30,6 +30,14 @@ LAUNCH_LAYER_MODULE = "hermes_bootstrap"
 #: Re-entrant so a single thread may nest boundaries.
 _BOUNDARY_LOCK = threading.RLock()
 
+#: Environment the Agent's ``pm.activate_dependencies`` rewrites in whatever
+#: process imports ``hermes_bootstrap``: it exports the checkout plus the Agent's
+#: own selected venv as ``PYTHONPATH``, drops ``VIRTUAL_ENV`` and prepends the
+#: venv's bin to ``PATH``. That venv runs its own Python when a lazy install is
+#: pending, so anything it leaves here makes this process import dependencies it
+#: cannot load.
+_BOUNDARY_ENV = ("PYTHONPATH", "VIRTUAL_ENV", "PATH")
+
 
 def launch_layer_loaded() -> bool:
     """True once the Agent launch layer is imported and cannot relaunch again."""
@@ -55,16 +63,41 @@ def agent_import_boundary():
     ``run_agent`` import every request can reach -- finds that module cached and
     applies nothing, instead of exposing the dual-purpose policy variable to
     unrelated threads for the length of an import that cannot relaunch.
+
+    The import mutates this process well beyond that variable, so the boundary
+    restores ``sys.path``, ``PYTHONPATH``, ``VIRTUAL_ENV``, ``PATH`` and
+    ``os.putenv``/``os.unsetenv`` afterwards: ``harden_import_path`` re-fronts the
+    Agent checkout, ``pm.activate_dependencies`` front-loads the Agent's selected
+    venv, and ``install_never_free_environ`` replaces the environ helpers. Leaving
+    any of that in place makes the server import the Agent's C-extensions
+    (``pydantic_core._pydantic_core``) into an interpreter that cannot load them.
     """
     if launch_layer_loaded():
         yield
         return
     with _BOUNDARY_LOCK:
         previous = os.environ.get(LAZY_INSTALL_GUARD)
+        saved_env = {key: os.environ.get(key) for key in _BOUNDARY_ENV}
+        saved_path = sys.path[:]
+        saved_putenv = os.putenv
+        saved_unsetenv = os.unsetenv
         os.environ[LAZY_INSTALL_GUARD] = "1"
         try:
             yield
         finally:
+            # The Agent's import hardens its own checkout onto sys.path, activates
+            # its selected venv and takes over os.putenv/os.unsetenv. None of that
+            # belongs to this process: the server keeps its own interpreter's
+            # dependencies (see #7982 -- an Agent venv left on sys.path is imported
+            # as C-extensions this Python cannot load).
+            sys.path[:] = saved_path
+            os.putenv = saved_putenv
+            os.unsetenv = saved_unsetenv
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
             if previous is None:
                 os.environ.pop(LAZY_INSTALL_GUARD, None)
             else:
