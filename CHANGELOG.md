@@ -81,7 +81,7 @@
   process (startup `activate_managed_agent()` and the first-chat `run_agent` import), and the
   operator's own value -- set, unset or `0` -- is restored as soon as the import returns.
   `bootstrap.py` no longer exports it to the server it launches; its capability probe still passes
-  it to the probe interpreter only. (#7982)
+  it to the probe interpreter only. (#7982) The Agent's import path, PYTHONPATH/PATH/VIRTUAL_ENV and the environ helpers are restored around the same boundary, so the server keeps its own interpreter's dependencies.
 
 - **Clarify questions work with Agents that pass the batch as `questions=`.** Some Hermes Agent builds call the
   WebUI clarify callback as `callback("", None, questions=[...])` instead of `callback([...])`. The adapter only
