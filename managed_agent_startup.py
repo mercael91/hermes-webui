@@ -39,6 +39,60 @@ _BOUNDARY_LOCK = threading.RLock()
 _BOUNDARY_ENV = ("PYTHONPATH", "VIRTUAL_ENV", "PATH")
 
 
+#: How far above an entry to look for the ``pyvenv.cfg`` naming its venv.
+_VENV_CFG_DEPTH = 4
+
+
+def _release_from_dir_name(part: str) -> tuple[int, int] | None:
+    """``python3.11`` -> ``(3, 11)``; None for any other directory name."""
+    if not part.startswith("python"):
+        return None
+    major, _, minor = part[len("python") :].partition(".")
+    if not (major.isdigit() and minor.isdigit()):
+        return None
+    return int(major), int(minor)
+
+
+def _venv_release(entry: str) -> tuple[int, int] | None:
+    """The Python release the ``pyvenv.cfg`` above ``entry`` names, if any."""
+    for candidate in (Path(entry), *Path(entry).parents)[:_VENV_CFG_DEPTH]:
+        config = candidate / "pyvenv.cfg"
+        if not config.is_file():
+            continue
+        try:
+            for line in config.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                name, _, value = line.partition("=")
+                if name.strip() == "version":
+                    parts = value.strip().split(".")
+                    return int(parts[0]), int(parts[1])
+        except (OSError, ValueError):
+            return None
+        return None
+    return None
+
+
+def _abi_incompatible(entry: str) -> bool:
+    """True when this interpreter cannot import C-extensions from ``entry``.
+
+    ``pm.activate_dependencies`` front-loads the venv selected for the pending
+    install; for a lazy install that is the Agent's own sandbox Python (a 3.14
+    sandbox under a 3.11 server), while an already-installed Agent's venv is
+    built for this interpreter and stays the running Agent's dependency source.
+    """
+    if not entry:
+        return False
+    release = _venv_release(entry)
+    if release is not None:
+        return release != sys.version_info[:2]
+    for part in Path(entry).parts:
+        found = _release_from_dir_name(part)
+        if found is not None and found != sys.version_info[:2]:
+            return True
+    return False
+
+
 def launch_layer_loaded() -> bool:
     """True once the Agent launch layer is imported and cannot relaunch again."""
     return LAUNCH_LAYER_MODULE in sys.modules
@@ -65,12 +119,16 @@ def agent_import_boundary():
     unrelated threads for the length of an import that cannot relaunch.
 
     The import mutates this process well beyond that variable, so the boundary
-    restores ``sys.path``, ``PYTHONPATH``, ``VIRTUAL_ENV``, ``PATH`` and
-    ``os.putenv``/``os.unsetenv`` afterwards: ``harden_import_path`` re-fronts the
-    Agent checkout, ``pm.activate_dependencies`` front-loads the Agent's selected
-    venv, and ``install_never_free_environ`` replaces the environ helpers. Leaving
-    any of that in place makes the server import the Agent's C-extensions
-    (``pydantic_core._pydantic_core``) into an interpreter that cannot load them.
+    restores ``PYTHONPATH``, ``VIRTUAL_ENV``, ``PATH`` and
+    ``os.putenv``/``os.unsetenv`` afterwards, and drops from ``sys.path`` whatever
+    the import added for another Python release: ``harden_import_path`` re-fronts
+    the Agent checkout and ``pm.activate_dependencies`` front-loads the selected
+    venv -- the Agent's sandbox Python when a lazy install is pending -- while
+    ``install_never_free_environ`` replaces the environ helpers. Left in place, that
+    other-release venv makes the next import load the Agent's C-extensions
+    (``pydantic_core._pydantic_core``) into an interpreter that cannot load them
+    (#7982); a venv built for this interpreter stays, so the running Agent keeps
+    resolving its dependencies in-process the way it already did.
     """
     if launch_layer_loaded():
         yield
@@ -86,11 +144,18 @@ def agent_import_boundary():
             yield
         finally:
             # The Agent's import hardens its own checkout onto sys.path, activates
-            # its selected venv and takes over os.putenv/os.unsetenv. None of that
-            # belongs to this process: the server keeps its own interpreter's
-            # dependencies (see #7982 -- an Agent venv left on sys.path is imported
-            # as C-extensions this Python cannot load).
-            sys.path[:] = saved_path
+            # its selected venv and takes over os.putenv/os.unsetenv. The server
+            # keeps its own interpreter: a venv of another Python release would be
+            # imported as C-extensions this one cannot load (#7982). What the Agent
+            # resolves from a venv built for this interpreter -- the installed
+            # Agent's in-process dependency source -- stays available, appended
+            # after the WebUI's own paths so no checkout shadows them.
+            added = [
+                entry
+                for entry in sys.path
+                if entry not in saved_path and not _abi_incompatible(entry)
+            ]
+            sys.path[:] = saved_path + added
             os.putenv = saved_putenv
             os.unsetenv = saved_unsetenv
             for key, value in saved_env.items():
