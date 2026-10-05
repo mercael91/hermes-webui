@@ -88,6 +88,8 @@ def test_in_process_agent_venv_stays_importable(tmp_path, monkeypatch):
         sys.modules.pop("hermes_bootstrap", None)
 
     assert str(venv) in sys.path
-    assert sys.path == host_sys_path + [str(venv)]
+    # ``pm.activate_dependencies`` front-loads the selected venv, so the Agent
+    # keeps resolving its dependencies ahead of the server's own paths.
+    assert sys.path == [str(venv)] + host_sys_path
     assert os.environ["PYTHONPATH"] == "/host/site-packages"
     assert os.environ["VIRTUAL_ENV"] == "/host/venv"

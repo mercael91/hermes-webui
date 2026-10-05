@@ -146,16 +146,23 @@ def agent_import_boundary():
             # The Agent's import hardens its own checkout onto sys.path, activates
             # its selected venv and takes over os.putenv/os.unsetenv. The server
             # keeps its own interpreter: a venv of another Python release would be
-            # imported as C-extensions this one cannot load (#7982). What the Agent
-            # resolves from a venv built for this interpreter -- the installed
-            # Agent's in-process dependency source -- stays available, appended
-            # after the WebUI's own paths so no checkout shadows them.
-            added = [
-                entry
-                for entry in sys.path
-                if entry not in saved_path and not _abi_incompatible(entry)
+            # imported as C-extensions this one cannot load (#7982). What
+            # `pm.activate_dependencies` left stays in the order it set: the
+            # installed Agent's venv keeps resolving its dependencies ahead of the
+            # server's paths, the precedence it has without this boundary, so the
+            # WebUI's earlier paths cannot shadow the Agent's own version of a
+            # shared dependency. Entries the activation dropped (the interpreter's
+            # own site-packages, which the server booted with) come back after
+            # them, so nothing the server needs is lost.
+            kept = [
+                entry for entry in sys.path if entry and not _abi_incompatible(entry)
             ]
-            sys.path[:] = saved_path + added
+            dropped = [
+                entry
+                for entry in saved_path
+                if entry not in kept and not _abi_incompatible(entry)
+            ]
+            sys.path[:] = kept + dropped
             os.putenv = saved_putenv
             os.unsetenv = saved_unsetenv
             for key, value in saved_env.items():
