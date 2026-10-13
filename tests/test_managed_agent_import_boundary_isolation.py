@@ -12,6 +12,10 @@ The boundary puts the owner's environment back, drops only the entries that
 belong to another release, keeps the venv the installed Agent runs from ahead of
 the server's own paths, and leaves the Agent's environ-array wrappers alone --
 those are what keep a concurrent read from touching a freed array.
+
+The wrappers belong to the running Agent, not to this module's tests:
+``_restore_process_state`` hands the process its own helpers and environment
+back after every test here, or the rest of the suite runs without them.
 """
 
 from __future__ import annotations
@@ -19,8 +23,10 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
+import subprocess
 import sys
 import sysconfig
+import threading
 
 import pytest
 
@@ -46,15 +52,49 @@ os.unsetenv = lambda *args: None
 _PACKAGE = "agent_generation_dep"
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_state():
+    """Hand this process back what an activated launch layer took over.
+
+    ``install_never_free_environ`` replaces ``os.putenv``/``os.unsetenv`` so a
+    concurrent read cannot touch a freed environ array, and the boundary leaves
+    that protection to the Agent -- correctly, because while the Agent runs it is
+    the owner of the process. In a test process it would outlive the test:
+    ``os.environ`` writes stop reaching the native environment that every later
+    test hands to its child processes. That is what failed shard 3 of the #7984
+    CI run -- a test file running after this one could not see the ``HOME`` it
+    exported, so its git credential helper was never found and git fell back to
+    prompting the user.
+
+    Snapshot before, restore after, and restore the helpers first so that the
+    environment rebuild below reaches the native array.
+    """
+    helpers = (os.putenv, os.unsetenv)
+    environ = os.environ.copy()
+    sys_path = sys.path[:]
+    yield
+    os.putenv, os.unsetenv = helpers
+    for key in set(os.environ) | set(environ):
+        value = environ.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    sys.path[:] = sys_path
+
+
 def _other_release() -> str:
     return f"{sys.version_info[0]}.{sys.version_info[1] + 1}"
 
 
-def _agent_with_venv(tmp_path, monkeypatch, release, *, cfg_key="version_info"):
+def _agent_with_venv(
+    tmp_path, monkeypatch, release, *, cfg_key="version_info", body=""
+):
     """A fake Agent checkout whose launch layer activates a ``release`` venv.
 
     ``cfg_key`` selects how the venv names its generation: ``venv`` writes
-    ``version``, uv writes ``version_info``.
+    ``version``, uv writes ``version_info``. ``body`` appends statements to the
+    launch layer, for a test that needs to see the activation while it runs.
     """
     agent = tmp_path / "agent"
     agent.mkdir()
@@ -65,7 +105,8 @@ def _agent_with_venv(tmp_path, monkeypatch, release, *, cfg_key="version_info"):
         f"{cfg_key} = {release}.1\n", encoding="utf-8"
     )
     (agent / "hermes_bootstrap.py").write_text(
-        _STUB.format(venv=str(venv), agent=str(agent)), encoding="utf-8"
+        _STUB.format(venv=str(venv), agent=str(agent)) + body,
+        encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(agent))
     # The owner of the process suppressed the relaunch: the precondition for the
@@ -104,10 +145,9 @@ def test_other_release_venv_is_dropped_and_environment_restored(
     assert os.environ["PATH"] == host_path
 
     # The Agent took over the environ helpers to keep a freed environ array from
-    # being read; the boundary leaves that protection in place, so put back what
-    # the stub replaced for the rest of the suite.
+    # being read; the boundary leaves that protection in place.
+    # ``_restore_process_state`` returns them to this process afterwards.
     assert (os.putenv, os.unsetenv) != (host_putenv, host_unsetenv)
-    os.putenv, os.unsetenv = host_putenv, host_unsetenv
 
 
 def test_in_process_agent_venv_stays_importable(tmp_path, monkeypatch):
@@ -257,3 +297,99 @@ def test_the_boundary_keeps_the_host_copy_importable(tmp_path, monkeypatch):
     finally:
         sys.modules.pop("hermes_bootstrap", None)
         sys.modules.pop(_PACKAGE, None)
+
+
+def test_the_activation_is_left_in_place_for_the_fixture(tmp_path, monkeypatch):
+    """One activated launch layer -- exactly the leak the fixture cleans up."""
+    _agent_with_venv(tmp_path, monkeypatch, _other_release())
+    host_putenv, host_unsetenv = os.putenv, os.unsetenv
+
+    try:
+        with agent_import_boundary():
+            importlib.import_module("hermes_bootstrap")
+    finally:
+        sys.modules.pop("hermes_bootstrap", None)
+
+    assert (os.putenv, os.unsetenv) != (host_putenv, host_unsetenv)
+
+
+def test_os_environ_reaches_child_processes_after_the_boundary(monkeypatch):
+    """The wrapper has to be back, or every later test loses its own env.
+
+    ``os.environ`` writes go through ``os.putenv``/``os.unsetenv``, so a process
+    still carrying the Agent's wrappers never updates the environ its children
+    inherit. Reads the child's own answer, not this process's dictionary.
+    """
+    monkeypatch.setenv("BOUNDARY_CHILD_PROBE", "1")
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ.get('BOUNDARY_CHILD_PROBE', ''))",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.strip() == "1"
+
+
+def test_a_second_boundary_waits_for_the_activation_in_flight(tmp_path, monkeypatch):
+    """The launch layer is cached before its activation has finished.
+
+    Every first chat imports ``run_agent``, and the import carrying the launch
+    layer puts it in ``sys.modules`` before its body -- the activation that
+    rewrites ``PYTHONPATH``/``PATH``/``VIRTUAL_ENV`` -- has run. A request that
+    read that cache without the boundary lock would import its dependencies
+    through the venv the first request is about to drop.
+    """
+    gate = tmp_path / "launch_gate.py"
+    gate.write_text(
+        "import threading\n"
+        "\n"
+        "entered = threading.Event()\n"
+        "release = threading.Event()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _agent_with_venv(
+        tmp_path,
+        monkeypatch,
+        _other_release(),
+        body=(
+            "import launch_gate\n"
+            "launch_gate.entered.set()\n"
+            "launch_gate.release.wait(5)\n"
+        ),
+    )
+    second_entered = threading.Event()
+
+    def activation():
+        with agent_import_boundary():
+            importlib.import_module("hermes_bootstrap")
+
+    def second_request():
+        with agent_import_boundary():
+            second_entered.set()
+
+    try:
+        import launch_gate
+
+        first = threading.Thread(target=activation)
+        first.start()
+        assert launch_gate.entered.wait(5), "the activation never started"
+        second = threading.Thread(target=second_request)
+        second.start()
+        retried = second_entered.wait(0.5)
+        launch_gate.release.set()
+        first.join(5)
+        second.join(5)
+
+        assert not retried, "a request entered while the activation was running"
+        assert second_entered.wait(5), "the waiting request never got through"
+        assert not first.is_alive() and not second.is_alive()
+    finally:
+        launch_gate.release.set()
+        sys.modules.pop("hermes_bootstrap", None)
+        sys.modules.pop("launch_gate", None)

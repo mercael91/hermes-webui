@@ -146,10 +146,14 @@ def agent_import_boundary():
     nothing. The Agent's own ``os.putenv``/``os.unsetenv`` wrappers stay in
     place: they are what keeps its environ array alive under a concurrent read.
     """
-    if not relaunch_suppressed() or launch_layer_loaded():
-        yield
-        return
+    # The lock comes first, the check second: a boundary that read
+    # ``launch_layer_loaded`` while another was still importing would see the
+    # launch layer cached -- Python caches it before its body runs -- and
+    # import its dependencies through the venv that boundary is about to drop.
     with _BOUNDARY_LOCK:
+        if not relaunch_suppressed() or launch_layer_loaded():
+            yield
+            return
         saved_env = {key: os.environ.get(key) for key in _BOUNDARY_ENV}
         saved_path = sys.path[:]
         try:
