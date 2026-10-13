@@ -391,5 +391,10 @@ def test_a_second_boundary_waits_for_the_activation_in_flight(tmp_path, monkeypa
         assert not first.is_alive() and not second.is_alive()
     finally:
         launch_gate.release.set()
+        # A failed wait above must not leave a worker rewriting the process state
+        # this test hands back: join every thread that was started.
+        for worker in (first, second):
+            if worker.ident is not None:
+                worker.join(10)
         sys.modules.pop("hermes_bootstrap", None)
         sys.modules.pop("launch_gate", None)
