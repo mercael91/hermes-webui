@@ -440,10 +440,11 @@ def ensure_agent_runtime_current() -> None:
 def require_ai_agent_class():
     """Import ``AIAgent`` after proving the loaded source revision is current."""
     ensure_agent_runtime_current()
-    # First-chat boundary: run_agent imports hermes_bootstrap, whose launch
-    # layer would relaunch this long-lived server into its sandbox (no WebUI
-    # dependencies -> ModuleNotFoundError). The override covers the import
-    # only, so the running app still honours security.allow_lazy_installs.
+    # First-chat boundary: run_agent imports hermes_bootstrap, which activates
+    # the Agent's dependency layer in this process when the process owner
+    # suppressed its relaunch. It is a no-op otherwise, and puts the owner's
+    # environment and the running interpreter's own sys.path back afterwards
+    # (#7982).
     with agent_import_boundary():
         from run_agent import AIAgent  # noqa: PLC0415
 
