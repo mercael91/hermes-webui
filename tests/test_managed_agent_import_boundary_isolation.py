@@ -27,6 +27,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+import types
 
 import pytest
 
@@ -373,13 +374,16 @@ def test_a_second_boundary_waits_for_the_activation_in_flight(tmp_path, monkeypa
         with agent_import_boundary():
             second_entered.set()
 
+    started = []
     try:
         import launch_gate
 
         first = threading.Thread(target=activation)
+        started.append(first)
         first.start()
         assert launch_gate.entered.wait(5), "the activation never started"
         second = threading.Thread(target=second_request)
+        started.append(second)
         second.start()
         retried = second_entered.wait(0.5)
         launch_gate.release.set()
@@ -390,11 +394,65 @@ def test_a_second_boundary_waits_for_the_activation_in_flight(tmp_path, monkeypa
         assert second_entered.wait(5), "the waiting request never got through"
         assert not first.is_alive() and not second.is_alive()
     finally:
-        launch_gate.release.set()
-        # A failed wait above must not leave a worker rewriting the process state
-        # this test hands back: join every thread that was started.
-        for worker in (first, second):
-            if worker.ident is not None:
-                worker.join(10)
+        # A failure above -- the entered wait included -- still has to hand this
+        # process back as it was, so the cleanup reads only names that exist on
+        # every path: the started threads are collected as they start, and the
+        # gate is reached through the import cache instead of a local the failed
+        # wait would leave unassigned (an UnboundLocalError here would replace
+        # the assertion that says what actually broke).
+        gate_module = sys.modules.get("launch_gate")
+        if gate_module is not None:
+            gate_module.release.set()
+        for worker in started:
+            worker.join(10)
         sys.modules.pop("hermes_bootstrap", None)
         sys.modules.pop("launch_gate", None)
+
+
+class _NeverEntered:
+    """The gate of a launch layer that never announces its activation.
+
+    ``set`` is a no-op and ``wait`` times out at once, so the test that owns the
+    gate fails on its first assertion -- the failure path whose cleanup must not
+    hide the failure.
+    """
+
+    def set(self):
+        return None
+
+    def wait(self, timeout=None):
+        return False
+
+
+def test_a_failed_entry_wait_still_hands_the_process_back(tmp_path, monkeypatch):
+    """Cleanup must survive the wait it guards failing.
+
+    ``test_a_second_boundary_waits_for_the_activation_in_flight`` enters that
+    cleanup with the activation worker started and the second thread not yet
+    bound: cleanup reading a local assigned on the way down raises
+    ``UnboundLocalError``, which replaces the assertion naming the real problem
+    and skips the join, leaving a worker rewriting this process's state. Fails
+    the entered wait on purpose and checks all three survivors.
+    """
+    gate = types.ModuleType("launch_gate")
+    gate.entered = _NeverEntered()
+    gate.release = threading.Event()
+    monkeypatch.setitem(sys.modules, "launch_gate", gate)
+    snapshot = _snapshot()
+    already = set(threading.enumerate())
+
+    with pytest.raises(AssertionError, match="the activation never started"):
+        test_a_second_boundary_waits_for_the_activation_in_flight(tmp_path, monkeypatch)
+
+    assert not [t for t in threading.enumerate() if t not in already], (
+        "cleanup left a worker running"
+    )
+    assert "hermes_bootstrap" not in sys.modules
+    assert "launch_gate" not in sys.modules
+    # sys.path is left alone: the failing test prepends its own gate, and the
+    # autouse fixture -- not this cleanup -- owns that. The environment is what
+    # an unjoined activation would still be rewriting. The host values are the
+    # ones the fixture set for the launch layer to front-load its own venv over.
+    assert os.environ.get("PATH") == snapshot[1], "the activation's PATH survived"
+    assert os.environ.get("VIRTUAL_ENV") == "/host/venv"
+    assert os.environ.get("PYTHONPATH") == "/host/site-packages"
